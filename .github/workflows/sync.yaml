@@ -1,0 +1,71 @@
+name: Sync Open WebUI to Aliyun ACR
+
+on:
+  # 1. 手动触发
+  workflow_dispatch:
+
+  # 2. 定时同步(每天 UTC 0点)
+  schedule:
+    - cron: '0 0 * * *'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        platform:
+          - amd64
+          - arm64
+        include:
+          - platform: amd64
+            platform_full: linux/amd64
+          - platform: arm64
+            platform_full: linux/arm64
+    steps:
+      # 1. 获取最新的 Open WebUI 版本号
+      - name: Get Latest Open WebUI Tag
+        id: get-latest-tag
+        run: |
+          LATEST_TAG=$(curl -s "https://api.github.com/repos/open-webui/open-webui/releases/latest" | jq -r '.tag_name')
+          if [ "$LATEST_TAG" = "null" ]; then
+            LATEST_TAG=$(curl -s "https://api.github.com/repos/open-webui/open-webui/tags" | jq -r '.[0].name')
+          fi
+          echo "Latest tag: $LATEST_TAG"
+          echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+
+      # 2. 登录 GitHub Container Registry
+      - name: Login to GitHub Packages
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 3. 登录阿里云 ACR
+      - name: Login to Aliyun ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.ALIYUN_ACR_REGISTRY }}
+          username: ${{ secrets.ALIYUN_USERNAME }}
+          password: ${{ secrets.ALIYUN_PASSWORD }}
+
+      # 4. 拉取对应平台的 Open WebUI 镜像
+      - name: Pull Open WebUI Image for ${{ matrix.platform_full }}
+        run: docker pull --platform=${{ matrix.platform_full }} ghcr.io/open-webui/open-webui:${{ steps.get-latest-tag.outputs.tag }}
+
+      # 5. 重新打标签（使用平台名字）
+      - name: Tag for Aliyun ACR with platform name
+        run: |
+          # 为镜像打上平台标签
+          docker tag ghcr.io/open-webui/open-webui:${{ steps.get-latest-tag.outputs.tag }} \
+            ${{ secrets.ALIYUN_ACR_REGISTRY }}/${{ secrets.ALIYUN_ACR_NAMESPACE }}/open-webui-${{ matrix.platform }}:${{ steps.get-latest-tag.outputs.tag }}
+
+          # 推送 latest 标签
+          docker tag ghcr.io/open-webui/open-webui:${{ steps.get-latest-tag.outputs.tag }} \
+            ${{ secrets.ALIYUN_ACR_REGISTRY }}/${{ secrets.ALIYUN_ACR_NAMESPACE }}/open-webui-${{ matrix.platform }}:latest
+
+      # 6. 推送镜像到阿里云 ACR
+      - name: Push to Aliyun ACR
+        run: |
+          docker push ${{ secrets.ALIYUN_ACR_REGISTRY }}/${{ secrets.ALIYUN_ACR_NAMESPACE }}/open-webui-${{ matrix.platform }}:${{ steps.get-latest-tag.outputs.tag }}
+          docker push ${{ secrets.ALIYUN_ACR_REGISTRY }}/${{ secrets.ALIYUN_ACR_NAMESPACE }}/open-webui-${{ matrix.platform }}:latest
