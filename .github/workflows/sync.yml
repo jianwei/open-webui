@@ -1,4 +1,4 @@
-name: Sync2 Open WebUI to Aliyun ACR
+name: Sync Open WebUI to Aliyun ACR
 
 on:
   workflow_dispatch:
