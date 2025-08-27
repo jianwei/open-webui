@@ -1,0 +1,224 @@
+name: Sync all Open WebUI to Aliyun ACR
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *'
+
+env:
+  SOURCE_REGISTRY: ghcr.io
+  SOURCE_NAMESPACE: open-webui
+  SOURCE_IMAGE: open-webui
+  TARGET_REGISTRY: ${{ secrets.ALIYUN_ACR_REGISTRY }}
+  TARGET_NAMESPACE: ${{ secrets.ALIYUN_ACR_NAMESPACE }}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        image_type: [default, cuda, cuda126]
+        platform: [amd64, arm64]
+        include:
+          - image_type: default
+            source_suffix: ""
+            target_suffix: ""
+          - image_type: cuda
+            source_suffix: "-cuda"
+            target_suffix: "-cuda"
+          - image_type: cuda126
+            source_suffix: "-cuda126"
+            target_suffix: "-cuda126"
+          - platform: amd64
+            platform_full: linux/amd64
+          - platform: arm64
+            platform_full: linux/arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 1. 获取最新版本号（对于特定标签，我们需要不同的处理逻辑）
+      - name: Get Image Tags
+        id: get-tags
+        run: |
+          # 对于 default 和 cuda 类型，使用正常的版本号
+          if [ "${{ matrix.image_type }}" = "default" ] || [ "${{ matrix.image_type }}" = "cuda" ]; then
+            # 尝试从 releases 获取
+            LATEST_TAG=$(curl -s -f "https://api.github.com/repos/open-webui/open-webui/releases/latest" | jq -r '.tag_name // empty')
+            
+            # 如果 releases 为空，尝试从 tags 获取
+            if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
+              echo "Getting tag from tags list..."
+              LATEST_TAG=$(curl -s -f "https://api.github.com/repos/open-webui/open-webui/tags" | jq -r '.[0].name // empty')
+            fi
+            
+            # 如果仍然为空，使用默认值
+            if [ -z "$LATEST_TAG" ]; then
+              echo "Warning: Could not fetch tag, using default"
+              LATEST_TAG="latest"
+            fi
+          else
+            # 对于 cuda126 等特定版本，使用固定标签
+            LATEST_TAG="dev"
+          fi
+          
+          echo "Using tag: $LATEST_TAG"
+          echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+
+      # 2. 设置镜像标签变量
+      - name: Set image tags
+        id: set-tags
+        run: |
+          # 构建完整的源镜像标签
+          SOURCE_TAG="${{ steps.get-tags.outputs.tag }}${{ matrix.source_suffix }}"
+          
+          echo "source_image_tag=$SOURCE_TAG" >> $GITHUB_OUTPUT
+          echo "source_image_full=${{ env.SOURCE_REGISTRY }}/${{ env.SOURCE_NAMESPACE }}/${{ env.SOURCE_IMAGE }}:$SOURCE_TAG" >> $GITHUB_OUTPUT
+          echo "target_image_version=${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/open-webui${{ matrix.target_suffix }}-${{ matrix.platform }}:${{ steps.get-tags.outputs.tag }}" >> $GITHUB_OUTPUT
+          echo "target_image_latest=${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/open-webui${{ matrix.target_suffix }}-${{ matrix.platform }}:latest" >> $GITHUB_OUTPUT
+          echo "target_image_with_suffix=${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/open-webui${{ matrix.target_suffix }}-${{ matrix.platform }}:$SOURCE_TAG" >> $GITHUB_OUTPUT
+
+      # 3. 登录 GitHub Container Registry
+      - name: Login to GitHub Packages
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.SOURCE_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 4. 登录阿里云 ACR
+      - name: Login to Aliyun ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.TARGET_REGISTRY }}
+          username: ${{ secrets.ALIYUN_USERNAME }}
+          password: ${{ secrets.ALIYUN_PASSWORD }}
+
+      # 5. 拉取镜像
+      - name: Pull Open WebUI Image for ${{ matrix.image_type }} (${{ matrix.platform_full }})
+        run: |
+          echo "Pulling image: ${{ steps.set-tags.outputs.source_image_full }}"
+          docker pull --platform=${{ matrix.platform_full }} ${{ steps.set-tags.outputs.source_image_full }} || \
+          echo "Warning: Image may not exist for this platform, continuing..."
+
+      # 6. 重新打标签
+      - name: Tag for Aliyun ACR
+        run: |
+          # 检查镜像是否存在
+          if docker inspect ${{ steps.set-tags.outputs.source_image_full }} > /dev/null 2>&1; then
+            docker tag ${{ steps.set-tags.outputs.source_image_full }} ${{ steps.set-tags.outputs.target_image_version }}
+            docker tag ${{ steps.set-tags.outputs.source_image_full }} ${{ steps.set-tags.outputs.target_image_latest }}
+            docker tag ${{ steps.set-tags.outputs.source_image_full }} ${{ steps.set-tags.outputs.target_image_with_suffix }}
+            echo "Tagged as: ${{ steps.set-tags.outputs.target_image_version }}"
+            echo "Tagged as: ${{ steps.set-tags.outputs.target_image_latest }}"
+            echo "Tagged as: ${{ steps.set-tags.outputs.target_image_with_suffix }}"
+          else
+            echo "Image not available for this platform, skipping tagging"
+          fi
+
+      # 7. 推送镜像到阿里云 ACR
+      - name: Push to Aliyun ACR
+        run: |
+          # 检查镜像是否存在，然后推送
+          if docker inspect ${{ steps.set-tags.outputs.target_image_version }} > /dev/null 2>&1; then
+            echo "Pushing version tag: ${{ steps.set-tags.outputs.target_image_version }}"
+            docker push ${{ steps.set-tags.outputs.target_image_version }}
+          fi
+          
+          if docker inspect ${{ steps.set-tags.outputs.target_image_latest }} > /dev/null 2>&1; then
+            echo "Pushing latest tag: ${{ steps.set-tags.outputs.target_image_latest }}"
+            docker push ${{ steps.set-tags.outputs.target_image_latest }}
+          fi
+          
+          if docker inspect ${{ steps.set-tags.outputs.target_image_with_suffix }} > /dev/null 2>&1; then
+            echo "Pushing full suffix tag: ${{ steps.set-tags.outputs.target_image_with_suffix }}"
+            docker push ${{ steps.set-tags.outputs.target_image_with_suffix }}
+          fi
+
+      # 8. 清理镜像
+      - name: Clean up
+        if: always()
+        run: |
+          docker rmi ${{ steps.set-tags.outputs.source_image_full }} || true
+          docker rmi ${{ steps.set-tags.outputs.target_image_version }} || true
+          docker rmi ${{ steps.set-tags.outputs.target_image_latest }} || true
+          docker rmi ${{ steps.set-tags.outputs.target_image_with_suffix }} || true
+          echo "Cleanup completed for ${{ matrix.image_type }}-${{ matrix.platform }}"
+
+  # 可选：创建多架构 manifest
+  create-multiarch-manifest:
+    runs-on: ubuntu-latest
+    needs: sync
+    strategy:
+      matrix:
+        image_type: [default, cuda, cuda126]
+        include:
+          - image_type: default
+            target_suffix: ""
+          - image_type: cuda
+            target_suffix: "-cuda"
+          - image_type: cuda126
+            target_suffix: "-cuda126"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get Latest Tag
+        id: get-tag
+        run: |
+          if [ "${{ matrix.image_type }}" = "default" ] || [ "${{ matrix.image_type }}" = "cuda" ]; then
+            LATEST_TAG=$(curl -s -f "https://api.github.com/repos/open-webui/open-webui/releases/latest" | jq -r '.tag_name // empty')
+            if [ -z "$LATEST_TAG" ]; then
+              LATEST_TAG="latest"
+            fi
+          else
+            LATEST_TAG="dev"
+          fi
+          echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+
+      - name: Login to Aliyun ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.TARGET_REGISTRY }}
+          username: ${{ secrets.ALIYUN_USERNAME }}
+          password: ${{ secrets.ALIYUN_PASSWORD }}
+
+      - name: Create and push multi-arch manifests
+        run: |
+          IMAGE_NAME="open-webui${{ matrix.target_suffix }}"
+          echo "Creating multi-arch manifest for $IMAGE_NAME:${{ steps.get-tag.outputs.tag }}"
+          
+          # 创建 manifest（只包含存在的架构）
+          docker manifest create \
+            ${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/$IMAGE_NAME:${{ steps.get-tag.outputs.tag }} \
+            ${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/$IMAGE_NAME-amd64:${{ steps.get-tag.outputs.tag }} \
+            ${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/$IMAGE_NAME-arm64:${{ steps.get-tag.outputs.tag }} \
+            --amend
+          
+          # 推送 manifest
+          docker manifest push \
+            ${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/$IMAGE_NAME:${{ steps.get-tag.outputs.tag }}
+          
+          # 同样为 latest 标签创建
+          echo "Creating multi-arch manifest for $IMAGE_NAME:latest"
+          docker manifest create \
+            ${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/$IMAGE_NAME:latest \
+            ${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/$IMAGE_NAME-amd64:latest \
+            ${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/$IMAGE_NAME-arm64:latest \
+            --amend
+          
+          docker manifest push \
+            ${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/$IMAGE_NAME:latest
+          
+          # 对于 cuda126，也创建带有完整标签的 manifest
+          if [ "${{ matrix.image_type }}" = "cuda126" ]; then
+            echo "Creating multi-arch manifest for $IMAGE_NAME:dev-cuda126"
+            docker manifest create \
+              ${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/$IMAGE_NAME:dev-cuda126 \
+              ${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/$IMAGE_NAME-amd64:dev-cuda126 \
+              ${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/$IMAGE_NAME-arm64:dev-cuda126 \
+              --amend
+            
+            docker manifest push \
+              ${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/$IMAGE_NAME:dev-cuda126
+          fi
