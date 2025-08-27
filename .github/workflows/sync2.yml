@@ -1,4 +1,4 @@
-name: Sync all Open WebUI to Aliyun ACR
+name: Sync Open WebUI to Aliyun ACR
 
 on:
   workflow_dispatch:
@@ -13,7 +13,7 @@ env:
   TARGET_NAMESPACE: ${{ secrets.ALIYUN_ACR_NAMESPACE }}
 
 jobs:
-  sync:
+  sync-platform-images:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -22,13 +22,13 @@ jobs:
         include:
           - image_type: default
             source_suffix: ""
-            target_suffix: ""
+            target_name: "open-webui"
           - image_type: cuda
             source_suffix: "-cuda"
-            target_suffix: "-cuda"
+            target_name: "open-webui-cuda"
           - image_type: cuda126
             source_suffix: "-cuda126"
-            target_suffix: "-cuda126"
+            target_name: "open-webui-cuda126"
           - platform: amd64
             platform_full: linux/amd64
           - platform: arm64
@@ -37,29 +37,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 1. 获取最新版本号（对于特定标签，我们需要不同的处理逻辑）
-      - name: Get Image Tags
-        id: get-tags
+      # 1. 获取最新版本号
+      - name: Get Latest Tag
+        id: get-tag
         run: |
-          # 对于 default 和 cuda 类型，使用正常的版本号
-          if [ "${{ matrix.image_type }}" = "default" ] || [ "${{ matrix.image_type }}" = "cuda" ]; then
-            # 尝试从 releases 获取
-            LATEST_TAG=$(curl -s -f "https://api.github.com/repos/open-webui/open-webui/releases/latest" | jq -r '.tag_name // empty')
-            
-            # 如果 releases 为空，尝试从 tags 获取
-            if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
-              echo "Getting tag from tags list..."
-              LATEST_TAG=$(curl -s -f "https://api.github.com/repos/open-webui/open-webui/tags" | jq -r '.[0].name // empty')
-            fi
-            
-            # 如果仍然为空，使用默认值
-            if [ -z "$LATEST_TAG" ]; then
-              echo "Warning: Could not fetch tag, using default"
-              LATEST_TAG="latest"
-            fi
-          else
-            # 对于 cuda126 等特定版本，使用固定标签
-            LATEST_TAG="dev"
+          # 尝试从 releases 获取
+          LATEST_TAG=$(curl -s -f "https://api.github.com/repos/open-webui/open-webui/releases/latest" | jq -r '.tag_name // empty')
+          
+          # 如果 releases 为空，尝试从 tags 获取
+          if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
+            echo "Getting tag from tags list..."
+            LATEST_TAG=$(curl -s -f "https://api.github.com/repos/open-webui/open-webui/tags" | jq -r '.[0].name // empty')
+          fi
+          
+          # 如果仍然为空，使用默认值
+          if [ -z "$LATEST_TAG" ]; then
+            echo "Warning: Could not fetch tag, using default"
+            LATEST_TAG="latest"
           fi
           
           echo "Using tag: $LATEST_TAG"
@@ -70,13 +64,14 @@ jobs:
         id: set-tags
         run: |
           # 构建完整的源镜像标签
-          SOURCE_TAG="${{ steps.get-tags.outputs.tag }}${{ matrix.source_suffix }}"
+          SOURCE_TAG="${{ steps.get-tag.outputs.tag }}${{ matrix.source_suffix }}"
+          
+          # 为目标镜像生成临时平台特定标签（用于后续创建manifest）
+          TARGET_TEMP_TAG="${{ steps.get-tag.outputs.tag }}-${{ matrix.platform }}"
           
           echo "source_image_tag=$SOURCE_TAG" >> $GITHUB_OUTPUT
           echo "source_image_full=${{ env.SOURCE_REGISTRY }}/${{ env.SOURCE_NAMESPACE }}/${{ env.SOURCE_IMAGE }}:$SOURCE_TAG" >> $GITHUB_OUTPUT
-          echo "target_image_version=${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/open-webui${{ matrix.target_suffix }}-${{ matrix.platform }}:${{ steps.get-tags.outputs.tag }}" >> $GITHUB_OUTPUT
-          echo "target_image_latest=${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/open-webui${{ matrix.target_suffix }}-${{ matrix.platform }}:latest" >> $GITHUB_OUTPUT
-          echo "target_image_with_suffix=${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/open-webui${{ matrix.target_suffix }}-${{ matrix.platform }}:$SOURCE_TAG" >> $GITHUB_OUTPUT
+          echo "target_temp_image=${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/${{ matrix.target_name }}:$TARGET_TEMP_TAG" >> $GITHUB_OUTPUT
 
       # 3. 登录 GitHub Container Registry
       - name: Login to GitHub Packages
@@ -101,64 +96,44 @@ jobs:
           docker pull --platform=${{ matrix.platform_full }} ${{ steps.set-tags.outputs.source_image_full }} || \
           echo "Warning: Image may not exist for this platform, continuing..."
 
-      # 6. 重新打标签
-      - name: Tag for Aliyun ACR
+      # 6. 重新打标签并推送到临时平台标签
+      - name: Tag and Push Platform-specific Image
         run: |
           # 检查镜像是否存在
           if docker inspect ${{ steps.set-tags.outputs.source_image_full }} > /dev/null 2>&1; then
-            docker tag ${{ steps.set-tags.outputs.source_image_full }} ${{ steps.set-tags.outputs.target_image_version }}
-            docker tag ${{ steps.set-tags.outputs.source_image_full }} ${{ steps.set-tags.outputs.target_image_latest }}
-            docker tag ${{ steps.set-tags.outputs.source_image_full }} ${{ steps.set-tags.outputs.target_image_with_suffix }}
-            echo "Tagged as: ${{ steps.set-tags.outputs.target_image_version }}"
-            echo "Tagged as: ${{ steps.set-tags.outputs.target_image_latest }}"
-            echo "Tagged as: ${{ steps.set-tags.outputs.target_image_with_suffix }}"
+            # 打上平台特定的临时标签
+            docker tag ${{ steps.set-tags.outputs.source_image_full }} ${{ steps.set-tags.outputs.target_temp_image }}
+            echo "Tagged as: ${{ steps.set-tags.outputs.target_temp_image }}"
+            
+            # 推送到临时标签
+            echo "Pushing platform-specific image: ${{ steps.set-tags.outputs.target_temp_image }}"
+            docker push ${{ steps.set-tags.outputs.target_temp_image }}
           else
-            echo "Image not available for this platform, skipping tagging"
+            echo "Image not available for ${{ matrix.platform }}, skipping"
           fi
 
-      # 7. 推送镜像到阿里云 ACR
-      - name: Push to Aliyun ACR
-        run: |
-          # 检查镜像是否存在，然后推送
-          if docker inspect ${{ steps.set-tags.outputs.target_image_version }} > /dev/null 2>&1; then
-            echo "Pushing version tag: ${{ steps.set-tags.outputs.target_image_version }}"
-            docker push ${{ steps.set-tags.outputs.target_image_version }}
-          fi
-          
-          if docker inspect ${{ steps.set-tags.outputs.target_image_latest }} > /dev/null 2>&1; then
-            echo "Pushing latest tag: ${{ steps.set-tags.outputs.target_image_latest }}"
-            docker push ${{ steps.set-tags.outputs.target_image_latest }}
-          fi
-          
-          if docker inspect ${{ steps.set-tags.outputs.target_image_with_suffix }} > /dev/null 2>&1; then
-            echo "Pushing full suffix tag: ${{ steps.set-tags.outputs.target_image_with_suffix }}"
-            docker push ${{ steps.set-tags.outputs.target_image_with_suffix }}
-          fi
-
-      # 8. 清理镜像
+      # 7. 清理镜像
       - name: Clean up
         if: always()
         run: |
           docker rmi ${{ steps.set-tags.outputs.source_image_full }} || true
-          docker rmi ${{ steps.set-tags.outputs.target_image_version }} || true
-          docker rmi ${{ steps.set-tags.outputs.target_image_latest }} || true
-          docker rmi ${{ steps.set-tags.outputs.target_image_with_suffix }} || true
-          echo "Cleanup completed for ${{ matrix.image_type }}-${{ matrix.platform }}"
+          docker rmi ${{ steps.set-tags.outputs.target_temp_image }} || true
+          echo "Cleanup completed for ${{ matrix.target_name }}-${{ matrix.platform }}"
 
-  # 可选：创建多架构 manifest
-  create-multiarch-manifest:
+  # 创建多架构 manifest
+  create-multiarch-manifests:
     runs-on: ubuntu-latest
-    needs: sync
+    needs: sync-platform-images
     strategy:
       matrix:
         image_type: [default, cuda, cuda126]
         include:
           - image_type: default
-            target_suffix: ""
+            target_name: "open-webui"
           - image_type: cuda
-            target_suffix: "-cuda"
+            target_name: "open-webui-cuda"
           - image_type: cuda126
-            target_suffix: "-cuda126"
+            target_name: "open-webui-cuda126"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -166,13 +141,12 @@ jobs:
       - name: Get Latest Tag
         id: get-tag
         run: |
-          if [ "${{ matrix.image_type }}" = "default" ] || [ "${{ matrix.image_type }}" = "cuda" ]; then
-            LATEST_TAG=$(curl -s -f "https://api.github.com/repos/open-webui/open-webui/releases/latest" | jq -r '.tag_name // empty')
-            if [ -z "$LATEST_TAG" ]; then
-              LATEST_TAG="latest"
-            fi
-          else
-            LATEST_TAG="dev"
+          LATEST_TAG=$(curl -s -f "https://api.github.com/repos/open-webui/open-webui/releases/latest" | jq -r '.tag_name // empty')
+          if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
+            LATEST_TAG=$(curl -s -f "https://api.github.com/repos/open-webui/open-webui/tags" | jq -r '.[0].name // empty')
+          fi
+          if [ -z "$LATEST_TAG" ]; then
+            LATEST_TAG="latest"
           fi
           echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
 
@@ -185,40 +159,67 @@ jobs:
 
       - name: Create and push multi-arch manifests
         run: |
-          IMAGE_NAME="open-webui${{ matrix.target_suffix }}"
-          echo "Creating multi-arch manifest for $IMAGE_NAME:${{ steps.get-tag.outputs.tag }}"
+          IMAGE_NAME="${{ matrix.target_name }}"
+          TAG="${{ steps.get-tag.outputs.tag }}"
           
-          # 创建 manifest（只包含存在的架构）
-          docker manifest create \
-            ${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/$IMAGE_NAME:${{ steps.get-tag.outputs.tag }} \
-            ${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/$IMAGE_NAME-amd64:${{ steps.get-tag.outputs.tag }} \
-            ${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/$IMAGE_NAME-arm64:${{ steps.get-tag.outputs.tag }} \
-            --amend
+          echo "Creating multi-arch manifest for $IMAGE_NAME:$TAG"
           
-          # 推送 manifest
-          docker manifest push \
-            ${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/$IMAGE_NAME:${{ steps.get-tag.outputs.tag }}
+          # 初始化 manifest 命令
+          MANIFEST_CMD="docker manifest create ${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/$IMAGE_NAME:$TAG"
           
-          # 同样为 latest 标签创建
-          echo "Creating multi-arch manifest for $IMAGE_NAME:latest"
-          docker manifest create \
-            ${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/$IMAGE_NAME:latest \
-            ${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/$IMAGE_NAME-amd64:latest \
-            ${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/$IMAGE_NAME-arm64:latest \
-            --amend
-          
-          docker manifest push \
-            ${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/$IMAGE_NAME:latest
-          
-          # 对于 cuda126，也创建带有完整标签的 manifest
-          if [ "${{ matrix.image_type }}" = "cuda126" ]; then
-            echo "Creating multi-arch manifest for $IMAGE_NAME:dev-cuda126"
-            docker manifest create \
-              ${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/$IMAGE_NAME:dev-cuda126 \
-              ${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/$IMAGE_NAME-amd64:dev-cuda126 \
-              ${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/$IMAGE_NAME-arm64:dev-cuda126 \
-              --amend
+          # 添加所有可用的平台
+          for PLATFORM in amd64 arm64; do
+            TEMP_TAG="$TAG-$PLATFORM"
+            IMAGE_REF="${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/$IMAGE_NAME:$TEMP_TAG"
             
-            docker manifest push \
-              ${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/$IMAGE_NAME:dev-cuda126
+            # 检查镜像是否存在（通过 manifest inspect）
+            if docker manifest inspect $IMAGE_REF > /dev/null 2>&1; then
+              echo "Adding platform $PLATFORM to manifest"
+              MANIFEST_CMD="$MANIFEST_CMD --amend $IMAGE_REF"
+            else
+              echo "Platform $PLATFORM not available, skipping"
+            fi
+          done
+          
+          # 创建 manifest（如果有可用的平台）
+          if [ "$MANIFEST_CMD" != "docker manifest create ${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/$IMAGE_NAME:$TAG" ]; then
+            eval $MANIFEST_CMD
+            docker manifest push ${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/$IMAGE_NAME:$TAG
+          else
+            echo "No platforms available for $IMAGE_NAME:$TAG, skipping manifest creation"
           fi
+          
+          # 创建 latest manifest
+          echo "Creating multi-arch manifest for $IMAGE_NAME:latest"
+          LATEST_MANIFEST_CMD="docker manifest create ${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/$IMAGE_NAME:latest"
+          
+          for PLATFORM in amd64 arm64; do
+            TEMP_TAG="$TAG-$PLATFORM"
+            IMAGE_REF="${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/$IMAGE_NAME:$TEMP_TAG"
+            
+            if docker manifest inspect $IMAGE_REF > /dev/null 2>&1; then
+              echo "Adding platform $PLATFORM to latest manifest"
+              LATEST_MANIFEST_CMD="$LATEST_MANIFEST_CMD --amend $IMAGE_REF"
+            fi
+          done
+          
+          if [ "$LATEST_MANIFEST_CMD" != "docker manifest create ${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/$IMAGE_NAME:latest" ]; then
+            eval $LATEST_MANIFEST_CMD
+            docker manifest push ${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/$IMAGE_NAME:latest
+          else
+            echo "No platforms available for $IMAGE_NAME:latest, skipping manifest creation"
+          fi
+
+      - name: Clean up temporary platform images
+        run: |
+          IMAGE_NAME="${{ matrix.target_name }}"
+          TAG="${{ steps.get-tag.outputs.tag }}"
+          
+          # 清理临时平台标签的镜像
+          for PLATFORM in amd64 arm64; do
+            TEMP_TAG="$TAG-$PLATFORM"
+            IMAGE_REF="${{ env.TARGET_REGISTRY }}/${{ env.TARGET_NAMESPACE }}/$IMAGE_NAME:$TEMP_TAG"
+            
+            # 使用阿里云 ACR API 删除临时标签（可选）
+            echo "Temporary image $IMAGE_REF can be cleaned up manually if needed"
+          done
